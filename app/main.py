@@ -16,16 +16,76 @@ def pcm16le_to_wav(pcm_bytes: bytes, sample_rate: int = 16000) -> bytes:
         wf.writeframes(pcm_bytes)
     return buf.getvalue()
 
+# Basit TR sayı sözlüğü (0..100)
+UNITS = {
+    "sıfır":0, "bir":1, "iki":2, "üç":3, "dört":4, "beş":5,
+    "altı":6, "yedi":7, "sekiz":8, "dokuz":9
+}
+TENS = {
+    "on":10, "yirmi":20, "otuz":30, "kırk":40, "elli":50,
+    "altmış":60, "yetmiş":70, "seksen":80, "doksan":90
+}
+SPECIAL = {"yüz":100}
+
+def normalize_tr(s: str) -> str:
+    s = s.lower()
+    # Basit temizlik: yüzde, pwm, led vb. sözcükleri etkisiz kıl
+    s = re.sub(r"[^\w\%\s]", " ", s)  # noktalama -> boşluk
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def parse_tr_number_0_100(text: str) -> int | None:
+    t = normalize_tr(text)
+    tokens = t.split()
+
+    # "yüz" tek başına → 100
+    if "yüz" in tokens:
+        return 100
+
+    # "% 45" veya "%45" → önce rakamla yakalama
+    m = re.search(r"%\s*(\d{1,3})", t)
+    if m:
+        v = int(m.group(1))
+        if 0 <= v <= 100:
+            return v
+
+    # Düz rakam → 0..100
+    m = re.search(r"\b(\d{1,3})\b", t)
+    if m:
+        v = int(m.group(1))
+        if 0 <= v <= 100:
+            return v
+
+    # Yazıyla (tens + unit) veya tek unit/tens
+    n = len(tokens)
+    for i in range(n):
+        w = tokens[i]
+        # tens + unit (örn. "kırk beş", "on bir")
+        if w in TENS and i+1 < n and tokens[i+1] in UNITS:
+            return TENS[w] + UNITS[tokens[i+1]]
+        # tek tens (örn. "kırk")
+        if w in TENS:
+            return TENS[w]
+        # tek unit (örn. "beş")
+        if w in UNITS:
+            return UNITS[w]
+
+    return None
+
 def extract_percent(text: str) -> int | None:
+    # Önce hızlı yol: rakamlı ifadeler
     m = re.search(r"%\s*(\d{1,3})", text)
     if m:
         v = int(m.group(1))
-        if 0 <= v <= 100: return v
+        if 0 <= v <= 100:
+            return v
     m = re.search(r"\b(\d{1,3})\b", text)
     if m:
         v = int(m.group(1))
-        if 0 <= v <= 100: return v
-    return None
+        if 0 <= v <= 100:
+            return v
+    # Sonra yazıyla Türkçe sayı çöz
+    return parse_tr_number_0_100(text)
 
 async def transcribe_deepgram(wav_bytes: bytes, lang: str = "tr") -> str:
     api_key = os.getenv("DEEPGRAM_API_KEY")
