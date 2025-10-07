@@ -28,7 +28,6 @@ def build_streaming_config():
         enable_automatic_punctuation=True,
     )
 
-    # Adaptation (opsiyonel)
     if use_adaptation and phrases:
         phrase_set = speech.SpeechAdaptation.PhraseSet(
             phrases=[speech.SpeechAdaptation.PhraseSet.Phrase(value=p) for p in phrases],
@@ -48,7 +47,6 @@ def build_streaming_config():
         )
     return streaming_config
 
-# Basit TR sayı ayrıştırıcı (0..100)
 UNITS = {"sıfır":0,"bir":1,"iki":2,"üç":3,"dört":4,"beş":5,"altı":6,"yedi":7,"sekiz":8,"dokuz":9}
 TENS  = {"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":70,"seksen":80,"doksan":90}
 
@@ -90,6 +88,14 @@ def extract_percent(text: str):
         if 0 <= v <= 100: return v
     return parse_tr_number_0_100(text)
 
+def is_stop_intent(text: str) -> bool:
+    t = normalize_tr(text)
+    stop_phrases = [
+        "asistan dur","asistan kapat","asistan bitir","asistan sus",
+        "dur","kapat","bitir","yeter","tamam yeter","durdur"
+    ]
+    return any(p in t for p in stop_phrases)
+
 async def ws_audio_to_gcp(ws: WebSocket, client: speech.SpeechClient, streaming_config: speech.StreamingRecognitionConfig):
     queue: asyncio.Queue[bytes] = asyncio.Queue()
 
@@ -109,53 +115,28 @@ async def ws_audio_to_gcp(ws: WebSocket, client: speech.SpeechClient, streaming_
         finally:
             await queue.put(b"")
 
-    async def consumer():
-        def requests():
-            while True:
-                chunk = asyncio.run(queue.get())
-                if not chunk:
-                    break
-                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+    def requests():
+        while True:
+            chunk = asyncio.run(queue.get())
+            if not chunk:
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
+    async def consume_responses():
         responses = client.streaming_recognize(streaming_config, requests())
         for resp in responses:
             for result in resp.results:
                 if result.is_final:
-                    text = result.alternatives[0].transcript
-                    yield text
+                    yield result.alternatives[0].transcript
 
     prod_task = asyncio.create_task(producer())
-
-    async def pump():
-        async for _ in asyncio.to_thread(lambda: None):
-            pass
-
-    loop = asyncio.get_event_loop()
-    texts_queue: asyncio.Queue[str] = asyncio.Queue()
-
-    def consume_in_thread():
-        try:
-            for final_text in asyncio.run(consumer()):  # not strictly correct, but placeholder; replaced below
-                asyncio.run_coroutine_threadsafe(texts_queue.put(final_text), loop)
-        except Exception:
-            pass
-
-    import threading
-    # Daha güvenli yaklaşım: consumer() generator'unu thread içinde çalıştır
-    def thread_target():
-        try:
-            for final_text in consumer():
-                asyncio.run_coroutine_threadsafe(texts_queue.put(final_text), loop)
-        except Exception:
-            pass
-
-    th = threading.Thread(target=thread_target, daemon=True)
-    th.start()
-
     try:
-        while True:
-            text = await texts_queue.get()
+        async for text in consume_responses():
             await ws.send_text(json.dumps({"type":"final_transcript","text": text}))
+            if is_stop_intent(text):
+                await ws.send_text(json.dumps({"type":"assistant_say","text":"Görüşürüz. Oturumu kapatıyorum."}))
+                await ws.send_text(json.dumps({"type":"session_end"}))
+                break
             percent = extract_percent(text)
             if percent is not None:
                 await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent": percent}}))
