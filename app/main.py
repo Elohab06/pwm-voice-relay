@@ -32,7 +32,6 @@ TENS={"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":
 
 def normalize_tr(s:str)->str:
     s=s.lower(); s=re.sub(r"[^\w%\s]"," ",s); s=re.sub(r"\s+"," ",s).strip(); return s
-
 def parse_tr_number_0_100(text:str):
     t=normalize_tr(text); toks=t.split()
     if "yüz" in toks: return 100
@@ -51,7 +50,6 @@ def parse_tr_number_0_100(text:str):
         if w in TENS: return TENS[w]
         if w in UNITS: return UNITS[w]
     return None
-
 def extract_percent(text:str):
     m=re.search(r"%\s*(\d{1,3})",text)
     if m:
@@ -62,7 +60,6 @@ def extract_percent(text:str):
         v=int(m.group(1)); 
         if 0<=v<=100: return v
     return parse_tr_number_0_100(text)
-
 def is_stop_intent(text:str)->bool:
     t=normalize_tr(text)
     for p in ["asistan dur","asistan kapat","asistan bitir","asistan sus","dur","kapat","bitir","yeter","tamam yeter","durdur"]:
@@ -75,16 +72,15 @@ async def ws_endpoint(ws: WebSocket):
     client=get_gcp_client()
     streaming_config=build_streaming_config()
     audio_q: queue.Queue[bytes|None]=queue.Queue()
+    out_q: queue.Queue[str]=queue.Queue()
+    first_flag = {"seen": False}
 
-    # gRPC istek generatoru (blocking)
     def requests():
         while True:
             chunk=audio_q.get()
             if chunk is None: break
             yield speech.StreamingRecognizeRequest(audio_content=chunk)
 
-    # gRPC tüketici thread’i: final transcriptleri kuyruğa yazar
-    out_q: queue.Queue[str]=queue.Queue()
     def consume():
         try:
             for resp in client.streaming_recognize(streaming_config, requests()):
@@ -97,21 +93,25 @@ async def ws_endpoint(ws: WebSocket):
 
     try:
         while True:
-            # 1) WS’ten ses veya stop sinyali al
             try:
                 raw = await ws.receive_text()
             except WebSocketDisconnect:
                 break
             msg=json.loads(raw)
             if msg.get("type")=="audio_chunk" and msg.get("format")=="PCM_S16LE_16000":
+                if not first_flag["seen"]:
+                    first_flag["seen"]=True
+                    await ws.send_text(json.dumps({"type":"assistant_say","text":"(debug) ses paketleri alınıyor"}))
                 audio_q.put(base64.b64decode(msg.get("data","")))
+            elif msg.get("type")=="end_of_utterance":
+                # Segmentleme bilgisi isterseniz burada ileride kullanılabilir
+                pass
             elif msg.get("type")=="session_end":
                 break
 
-            # 2) Bu arada oluşan final transcriptleri boşalt
             while not out_q.empty():
                 text=out_q.get()
-                await ws.send_text(json.dumps({"type":"final_transcript","text":text}))
+                await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) transcript: {text}"}))
                 if is_stop_intent(text):
                     await ws.send_text(json.dumps({"type":"session_end"}))
                     return
