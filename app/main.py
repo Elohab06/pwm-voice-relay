@@ -20,7 +20,6 @@ def build_streaming_config():
     use_adaptation = os.getenv("SPEECH_USE_ADAPTATION","false").lower()=="true"
     single_utt = os.getenv("SPEECH_SINGLE_UTTERANCE","false").lower()=="true"
     phrases = [p.strip() for p in os.getenv("SPEECH_PHRASES","").split(",") if p.strip()]
-
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=sample_rate,
@@ -82,13 +81,11 @@ async def ws_endpoint(ws: WebSocket):
         streaming_config=build_streaming_config()
         audio_q: queue.Queue[bytes|None]=queue.Queue()
         out_q: queue.Queue[tuple[str,bool]]=queue.Queue()
-
         def requests():
             while True:
                 chunk=audio_q.get()
                 if chunk is None: break
                 yield speech.StreamingRecognizeRequest(audio_content=chunk)
-
         def consume():
             try:
                 for resp in client.streaming_recognize(streaming_config, requests()):
@@ -96,11 +93,8 @@ async def ws_endpoint(ws: WebSocket):
                         text = result.alternatives[0].transcript or ""
                         out_q.put((text, result.is_final))
             except Exception:
-                # hata durumunda sessiz kal (RPi tarafı logluyor)
                 pass
-
         th=threading.Thread(target=consume,daemon=True); th.start()
-
         while True:
             try:
                 raw = await ws.receive_text()
@@ -113,12 +107,12 @@ async def ws_endpoint(ws: WebSocket):
                 pass
             elif msg.get("type")=="session_end":
                 break
-
             while not out_q.empty():
                 text,is_final=out_q.get()
                 if not text: continue
                 if is_final:
                     if is_stop_intent(text):
+                        await ws.send_text(json.dumps({"type":"assistant_say","text":"Tamam durdum."}))
                         await ws.send_text(json.dumps({"type":"session_end"}))
                         audio_q.put(None); th.join(timeout=2.0)
                         return
@@ -127,6 +121,5 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"PWM'i yüzde {p} olarak ayarlıyorum."}))
     finally:
-        try:
-            audio_q.put(None)
+        try: audio_q.put(None)
         except: pass
