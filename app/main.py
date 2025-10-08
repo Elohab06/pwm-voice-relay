@@ -17,19 +17,26 @@ def get_gcp_client():
 def build_streaming_config():
     sample_rate = int(os.getenv("SPEECH_SAMPLE_RATE","16000"))
     language = os.getenv("SPEECH_LANGUAGE","tr-TR")
+    use_adaptation = os.getenv("SPEECH_USE_ADAPTATION","false").lower()=="true"
+    single_utt = os.getenv("SPEECH_SINGLE_UTTERANCE","false").lower()=="true"
+    phrases = [p.strip() for p in os.getenv("SPEECH_PHRASES","").split(",") if p.strip()]
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=sample_rate,
         language_code=language,
         enable_automatic_punctuation=True,
     )
-    return speech.StreamingRecognitionConfig(
-        config=config, interim_results=True, single_utterance=False
+    streaming_config = speech.StreamingRecognitionConfig(
+        config=config, interim_results=True, single_utterance=single_utt,
     )
+    if use_adaptation and phrases:
+        ps = [speech.SpeechAdaptation.PhraseSet.Phrase(value=p) for p in phrases]
+        sps = speech.SpeechAdaptation.PhraseSet(phrases=ps)
+        streaming_config.adaptation = speech.SpeechAdaptation(phrase_sets=[sps])
+    return streaming_config
 
 UNITS={"sıfır":0,"bir":1,"iki":2,"üç":3,"dört":4,"beş":5,"altı":6,"yedi":7,"sekiz":8,"dokuz":9}
 TENS={"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":70,"seksen":80,"doksan":90}
-
 def normalize_tr(s:str)->str:
     s=s.lower(); s=re.sub(r"[^\w%\s]"," ",s); s=re.sub(r"\s+"," ",s).strip(); return s
 def parse_tr_number_0_100(text:str):
@@ -72,7 +79,7 @@ async def ws_endpoint(ws: WebSocket):
     client=get_gcp_client()
     streaming_config=build_streaming_config()
     audio_q: queue.Queue[bytes|None]=queue.Queue()
-    out_q: queue.Queue[str]=queue.Queue()
+    out_q: queue.Queue[tuple[str,bool]]=queue.Queue()
     first_flag = {"seen": False}
 
     def requests():
@@ -85,8 +92,8 @@ async def ws_endpoint(ws: WebSocket):
         try:
             for resp in client.streaming_recognize(streaming_config, requests()):
                 for result in resp.results:
-                    if result.is_final:
-                        out_q.put(result.alternatives[0].transcript or "")
+                    text = result.alternatives[0].transcript or ""
+                    out_q.put((text, result.is_final))
         except Exception:
             pass
     th=threading.Thread(target=consume,daemon=True); th.start()
@@ -104,21 +111,22 @@ async def ws_endpoint(ws: WebSocket):
                     await ws.send_text(json.dumps({"type":"assistant_say","text":"(debug) ses paketleri alınıyor"}))
                 audio_q.put(base64.b64decode(msg.get("data","")))
             elif msg.get("type")=="end_of_utterance":
-                # Segmentleme bilgisi isterseniz burada ileride kullanılabilir
                 pass
             elif msg.get("type")=="session_end":
                 break
-
             while not out_q.empty():
-                text=out_q.get()
-                await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) transcript: {text}"}))
-                if is_stop_intent(text):
-                    await ws.send_text(json.dumps({"type":"session_end"}))
-                    return
-                p=extract_percent(text)
-                if p is not None:
-                    await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
-                    await ws.send_text(json.dumps({"type":"assistant_say","text":f"PWM'i yüzde {p} olarak ayarlıyorum."}))
+                text,is_final=out_q.get()
+                if not text: continue
+                if is_final:
+                    await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) transcript: {text}"}))
+                    if is_stop_intent(text):
+                        await ws.send_text(json.dumps({"type":"session_end"})); return
+                    p=extract_percent(text)
+                    if p is not None:
+                        await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
+                        await ws.send_text(json.dumps({"type":"assistant_say","text":f"PWM'i yüzde {p} olarak ayarlıyorum."}))
+                else:
+                    await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) partial: {text[:40]}"}))
     finally:
         audio_q.put(None)
         try: th.join(timeout=2.0)
