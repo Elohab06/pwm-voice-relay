@@ -1,4 +1,4 @@
-import os, json, base64, re, threading, queue
+import os, json, base64, re, threading, queue, traceback
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google.cloud import speech
 from google.oauth2 import service_account
@@ -17,23 +17,15 @@ def get_gcp_client():
 def build_streaming_config():
     sample_rate = int(os.getenv("SPEECH_SAMPLE_RATE","16000"))
     language = os.getenv("SPEECH_LANGUAGE","tr-TR")
-    use_adaptation = os.getenv("SPEECH_USE_ADAPTATION","false").lower()=="true"
-    single_utt = os.getenv("SPEECH_SINGLE_UTTERANCE","false").lower()=="true"
-    phrases = [p.strip() for p in os.getenv("SPEECH_PHRASES","").split(",") if p.strip()]
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=sample_rate,
         language_code=language,
         enable_automatic_punctuation=True,
     )
-    streaming_config = speech.StreamingRecognitionConfig(
-        config=config, interim_results=True, single_utterance=single_utt,
+    return speech.StreamingRecognitionConfig(
+        config=config, interim_results=True, single_utterance=False
     )
-    if use_adaptation and phrases:
-        ps = [speech.SpeechAdaptation.PhraseSet.Phrase(value=p) for p in phrases]
-        sps = speech.SpeechAdaptation.PhraseSet(phrases=ps)
-        streaming_config.adaptation = speech.SpeechAdaptation(phrase_sets=[sps])
-    return streaming_config
 
 UNITS={"sıfır":0,"bir":1,"iki":2,"üç":3,"dört":4,"beş":5,"altı":6,"yedi":7,"sekiz":8,"dokuz":9}
 TENS={"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":70,"seksen":80,"doksan":90}
@@ -76,29 +68,32 @@ def is_stop_intent(text:str)->bool:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    client=get_gcp_client()
-    streaming_config=build_streaming_config()
-    audio_q: queue.Queue[bytes|None]=queue.Queue()
-    out_q: queue.Queue[tuple[str,bool]]=queue.Queue()
-    first_flag = {"seen": False}
-
-    def requests():
-        while True:
-            chunk=audio_q.get()
-            if chunk is None: break
-            yield speech.StreamingRecognizeRequest(audio_content=chunk)
-
-    def consume():
-        try:
-            for resp in client.streaming_recognize(streaming_config, requests()):
-                for result in resp.results:
-                    text = result.alternatives[0].transcript or ""
-                    out_q.put((text, result.is_final))
-        except Exception:
-            pass
-    th=threading.Thread(target=consume,daemon=True); th.start()
-
+    # session_start ACK (bağlantıyı test etmek için)
+    await ws.send_text(json.dumps({"type":"assistant_say","text":"(debug) session started"}))
     try:
+        client=get_gcp_client()
+        streaming_config=build_streaming_config()
+        audio_q: queue.Queue[bytes|None]=queue.Queue()
+        out_q: queue.Queue[tuple[str,bool]]=queue.Queue()
+        first_flag={"seen":False}
+
+        def requests():
+            while True:
+                chunk=audio_q.get()
+                if chunk is None: break
+                yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+        def consume():
+            try:
+                for resp in client.streaming_recognize(streaming_config, requests()):
+                    for result in resp.results:
+                        text = result.alternatives[0].transcript or ""
+                        out_q.put((text, result.is_final))
+            except Exception as e:
+                out_q.put((f"__ERROR__:{e}", True))
+
+        th=threading.Thread(target=consume,daemon=True); th.start()
+
         while True:
             try:
                 raw = await ws.receive_text()
@@ -114,20 +109,25 @@ async def ws_endpoint(ws: WebSocket):
                 pass
             elif msg.get("type")=="session_end":
                 break
+
             while not out_q.empty():
                 text,is_final=out_q.get()
+                if text.startswith("__ERROR__"):
+                    await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) error: {text[9:]}"}))
+                    continue
                 if not text: continue
                 if is_final:
                     await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) transcript: {text}"}))
                     if is_stop_intent(text):
-                        await ws.send_text(json.dumps({"type":"session_end"})); return
+                        await ws.send_text(json.dumps({"type":"session_end"})); audio_q.put(None); th.join(timeout=2.0); return
                     p=extract_percent(text)
                     if p is not None:
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"PWM'i yüzde {p} olarak ayarlıyorum."}))
                 else:
                     await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) partial: {text[:40]}"}))
-    finally:
-        audio_q.put(None)
-        try: th.join(timeout=2.0)
-        except: pass
+    except Exception as e:
+        try:
+            await ws.send_text(json.dumps({"type":"assistant_say","text":f"(debug) fatal: {e}"}))
+        except:
+            pass
