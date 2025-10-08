@@ -119,7 +119,7 @@ async def ws_endpoint(ws: WebSocket):
                     p=extract_percent(text)
                     if p is not None:
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
-                        await ws.send_text(json.dumps({"type":"assistant_say","text":f"PWM'i yüzde {p} olarak ayarlıyorum."}))
+                        await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p} olarak ayarlıyorum."}))
     finally:
         try: audio_q.put(None)
         except: pass
