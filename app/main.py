@@ -2,12 +2,70 @@ import os, json, base64, re, threading, queue
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google.cloud import speech
 from google.oauth2 import service_account
+from openai import OpenAI  # LLM
 
 app = FastAPI()
 
 @app.get("/healthz")
 async def healthz():
     return {"status":"ok","lang":os.getenv("LANG","tr-TR")}
+
+# ---------- OpenAI (LLM) ----------
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_RUNTIME")
+oa_client = OpenAI(api_key=API_KEY)
+
+def build_llm_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "set_pwm",
+                "description": "Set PWM reference as absolute percent (0-100).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "percent": {"type": "integer", "minimum": 0, "maximum": 100}
+                    },
+                    "required": ["percent"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "stop_session",
+                "description": "End the current voice session.",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        }
+    ]
+
+def llm_decide(user_text: str, history: list[dict]) -> dict:
+    messages = [
+        {"role":"system","content":"Türkçe konuş. Kısa ve net cevap ver. PWM yüzdesi istenirse uygun aracı çağır."}
+    ]
+    for m in history[-6:]:
+        messages.append(m)
+    messages.append({"role":"user","content":user_text})
+    resp = oa_client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=messages,
+        tools=build_llm_tools(),
+        tool_choice="auto",
+        temperature=0.3
+    )
+    msg = resp.choices[0].message
+    if getattr(msg, "tool_calls", None):
+        tc = msg.tool_calls[0]
+        name = tc.function.name
+        try:
+            args = json.loads(tc.function.arguments or "{}")
+        except Exception:
+            args = {}
+        return {"type":"tool","name":name,"args":args}
+    return {"type":"say","text": (msg.content or "").strip() or "Anladım."}
+# ----------------------------------
 
 def get_gcp_client():
     creds_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
@@ -76,6 +134,7 @@ def is_stop_intent(text:str)->bool:
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
+    chat_history = []  # kısa oturum bağlamı
     try:
         client=get_gcp_client()
         streaming_config=build_streaming_config()
@@ -120,6 +179,30 @@ async def ws_endpoint(ws: WebSocket):
                     if p is not None:
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p} olarak ayarlıyorum."}))
+                    else:
+                        # LLM fallback: sohbet ya da araç kararı
+                        chat_history.append({"role":"user","content":text})
+                        result = llm_decide(text, chat_history)
+                        if result.get("type")=="tool":
+                            name = result.get("name")
+                            args = result.get("args",{})
+                            if name=="set_pwm" and isinstance(args.get("percent"), int):
+                                p2 = max(0, min(100, int(args["percent"])))
+                                await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p2}}))
+                                await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p2} olarak ayarlıyorum."}))
+                                chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p2} olarak ayarlıyorum."})
+                            elif name=="stop_session":
+                                await ws.send_text(json.dumps({"type":"assistant_say","text":"Tamam durdum."}))
+                                await ws.send_text(json.dumps({"type":"session_end"}))
+                                audio_q.put(None); th.join(timeout=2.0)
+                                return
+                            else:
+                                await ws.send_text(json.dumps({"type":"assistant_say","text":"Anladım."}))
+                                chat_history.append({"role":"assistant","content":"Anladım."})
+                        else:
+                            say = result.get("text","Anladım.")
+                            await ws.send_text(json.dumps({"type":"assistant_say","text":say}))
+                            chat_history.append({"role":"assistant","content":say})
     finally:
         try: audio_q.put(None)
         except: pass
