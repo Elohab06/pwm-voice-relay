@@ -2,7 +2,7 @@ import os, json, base64, re, threading, queue
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google.cloud import speech
 from google.oauth2 import service_account
-from openai import OpenAI  # LLM
+from openai import OpenAI
 
 app = FastAPI()
 
@@ -10,7 +10,6 @@ app = FastAPI()
 async def healthz():
     return {"status":"ok","lang":os.getenv("LANG","tr-TR")}
 
-# ---------- OpenAI (LLM) ----------
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 API_KEY = os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY_RUNTIME")
 oa_client = OpenAI(api_key=API_KEY)
@@ -29,14 +28,6 @@ def build_llm_tools():
                     },
                     "required": ["percent"]
                 }
-            }
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "stop_session",
-                "description": "End the current voice session.",
-                "parameters": {"type": "object", "properties": {}}
             }
         }
     ]
@@ -65,7 +56,6 @@ def llm_decide(user_text: str, history: list[dict]) -> dict:
             args = {}
         return {"type":"tool","name":name,"args":args}
     return {"type":"say","text": (msg.content or "").strip() or "Anladım."}
-# ----------------------------------
 
 def get_gcp_client():
     creds_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
@@ -125,16 +115,11 @@ def extract_percent(text:str):
         v=int(m.group(1)); 
         if 0<=v<=100: return v
     return parse_tr_number_0_100(text)
-def is_stop_intent(text:str)->bool:
-    t=normalize_tr(text)
-    for p in ["asistan dur","asistan kapat","asistan bitir","asistan sus","dur","kapat","bitir","yeter","tamam yeter","durdur"]:
-        if p in t: return True
-    return False
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
-    chat_history = []  # kısa oturum bağlamı
+    chat_history = []
     try:
         client=get_gcp_client()
         streaming_config=build_streaming_config()
@@ -170,13 +155,11 @@ async def ws_endpoint(ws: WebSocket):
                 text,is_final=out_q.get()
                 if not text: continue
                 if is_final:
-
                     p=extract_percent(text)
                     if p is not None:
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p} olarak ayarlıyorum."}))
                     else:
-                        # LLM fallback: sohbet ya da araç kararı
                         chat_history.append({"role":"user","content":text})
                         result = llm_decide(text, chat_history)
                         if result.get("type")=="tool":
@@ -187,12 +170,6 @@ async def ws_endpoint(ws: WebSocket):
                                 await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p2}}))
                                 await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p2} olarak ayarlıyorum."}))
                                 chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p2} olarak ayarlıyorum."})
-
-
-    else:
-        await ws.send_text(json.dumps({"type":"assistant_say","text":"Dinliyorum."}))
-        # oturumu kapatma
-
                             else:
                                 await ws.send_text(json.dumps({"type":"assistant_say","text":"Anladım."}))
                                 chat_history.append({"role":"assistant","content":"Anladım."})
