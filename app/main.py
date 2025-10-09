@@ -192,10 +192,15 @@ async def ws_endpoint(ws: WebSocket):
                                 await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p2} olarak ayarlıyorum."}))
                                 chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p2} olarak ayarlıyorum."})
                             elif name=="stop_session":
-                                await ws.send_text(json.dumps({"type":"assistant_say","text":"Tamam durdum."}))
-                                await ws.send_text(json.dumps({"type":"session_end"}))
-                                audio_q.put(None); th.join(timeout=2.0)
-                                return
+    if is_stop_intent(text):
+        await ws.send_text(json.dumps({"type":"assistant_say","text":"Tamam durdum."}))
+        await ws.send_text(json.dumps({"type":"session_end"}))
+        audio_q.put(None); th.join(timeout=2.0)
+        return
+    else:
+        await ws.send_text(json.dumps({"type":"assistant_say","text":"Dinliyorum."}))
+        # oturumu kapatma
+
                             else:
                                 await ws.send_text(json.dumps({"type":"assistant_say","text":"Anladım."}))
                                 chat_history.append({"role":"assistant","content":"Anladım."})
