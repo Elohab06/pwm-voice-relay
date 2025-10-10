@@ -161,7 +161,7 @@ async def ws_endpoint(ws: WebSocket):
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p} olarak ayarlıyorum."}))
                     else:
                         chat_history.append({"role":"user","content":text})
-                        result = llm_decide(text, chat_history)
+                        result = safe_llm_decide(text, chat_history)
                         if result.get("type")=="tool":
                             name = result.get("name")
                             args = result.get("args",{})
@@ -180,3 +180,9 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         try: audio_q.put(None)
         except: pass
+
+def safe_llm_decide(user_text: str, history: list[dict]) -> dict:
+    try:
+        return llm_decide(user_text, history)
+    except Exception:
+        return {"type":"say","text":"Şu an cevaplayamıyorum."}
