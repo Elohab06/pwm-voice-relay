@@ -87,6 +87,17 @@ UNITS={"sıfır":0,"bir":1,"iki":2,"üç":3,"dört":4,"beş":5,"altı":6,"yedi":
 TENS={"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":70,"seksen":80,"doksan":90}
 def normalize_tr(s:str)->str:
     s=s.lower(); s=re.sub(r"[^\w%\s]"," ",s); s=re.sub(r"\s+"," ",s).strip(); return s
+def extract_drive_cmd(text: str) -> str | None:
+    t = normalize_tr(text)
+    toks = t.split()
+    # Tam kelime eşleşmesi: "durumu" ≠ "dur"
+    if "ileri" in toks or "ileri_git" in toks:
+        return "FWD"
+    if "geri" in toks or "geriye" in toks or "geri_git" in toks:
+        return "REV"
+    if "dur" in toks or "durdur" in toks or "stop" in toks:
+        return "STOP"
+    return None
 def parse_tr_number_0_100(text:str):
     t=normalize_tr(text); toks=t.split()
     if "yüz" in toks: return 100
