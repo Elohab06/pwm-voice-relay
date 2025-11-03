@@ -1,4 +1,5 @@
 import os, json, base64, re, threading, queue
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google.cloud import speech
 from google.oauth2 import service_account
@@ -29,6 +30,20 @@ def build_llm_tools():
                     "required": ["percent"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "drive_cmd",
+                "description": "Yön komutu gönder (ileri/geri/dur).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type":"string","enum":["FWD","REV","STOP"]}
+                    },
+                    "required": ["action"]
+                }
+            }
         }
     ]
 
@@ -39,6 +54,7 @@ def llm_decide(user_text: str, history: list[dict]) -> dict:
     for m in history[-6:]:
         messages.append(m)
     messages.append({"role":"user","content":user_text})
+
     resp = oa_client.chat.completions.create(
         model=OPENAI_MODEL,
         messages=messages,
@@ -68,6 +84,7 @@ def build_streaming_config():
     use_adaptation = os.getenv("SPEECH_USE_ADAPTATION","false").lower()=="true"
     single_utt = os.getenv("SPEECH_SINGLE_UTTERANCE","false").lower()=="true"
     phrases = [p.strip() for p in os.getenv("SPEECH_PHRASES","").split(",") if p.strip()]
+
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=sample_rate,
@@ -85,8 +102,10 @@ def build_streaming_config():
 
 UNITS={"sıfır":0,"bir":1,"iki":2,"üç":3,"dört":4,"beş":5,"altı":6,"yedi":7,"sekiz":8,"dokuz":9}
 TENS={"on":10,"yirmi":20,"otuz":30,"kırk":40,"elli":50,"altmış":60,"yetmiş":70,"seksen":80,"doksan":90}
+
 def normalize_tr(s:str)->str:
     s=s.lower(); s=re.sub(r"[^\w%\s]"," ",s); s=re.sub(r"\s+"," ",s).strip(); return s
+
 def extract_drive_cmd(text: str) -> str | None:
     t = normalize_tr(text)
     toks = t.split()
@@ -98,16 +117,17 @@ def extract_drive_cmd(text: str) -> str | None:
     if "dur" in toks or "durdur" in toks or "stop" in toks:
         return "STOP"
     return None
+
 def parse_tr_number_0_100(text:str):
     t=normalize_tr(text); toks=t.split()
     if "yüz" in toks: return 100
     m=re.search(r"%\s*(\d{1,3})",t)
     if m:
-        v=int(m.group(1)); 
+        v=int(m.group(1));
         if 0<=v<=100: return v
     m=re.search(r"\b(\d{1,3})\b",t)
     if m:
-        v=int(m.group(1)); 
+        v=int(m.group(1));
         if 0<=v<=100: return v
     n=len(toks)
     for i in range(n):
@@ -116,14 +136,15 @@ def parse_tr_number_0_100(text:str):
         if w in TENS: return TENS[w]
         if w in UNITS: return UNITS[w]
     return None
+
 def extract_percent(text:str):
     m=re.search(r"%\s*(\d{1,3})",text)
     if m:
-        v=int(m.group(1)); 
+        v=int(m.group(1));
         if 0<=v<=100: return v
     m=re.search(r"\b(\d{1,3})\b",text)
     if m:
-        v=int(m.group(1)); 
+        v=int(m.group(1));
         if 0<=v<=100: return v
     return parse_tr_number_0_100(text)
 
@@ -134,13 +155,16 @@ async def ws_endpoint(ws: WebSocket):
     try:
         client=get_gcp_client()
         streaming_config=build_streaming_config()
+
         audio_q: queue.Queue[bytes|None]=queue.Queue()
         out_q: queue.Queue[tuple[str,bool]]=queue.Queue()
+
         def requests():
             while True:
                 chunk=audio_q.get()
                 if chunk is None: break
                 yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
         def consume():
             try:
                 for resp in client.streaming_recognize(streaming_config, requests()):
@@ -149,12 +173,15 @@ async def ws_endpoint(ws: WebSocket):
                         out_q.put((text, result.is_final))
             except Exception:
                 pass
+
         th=threading.Thread(target=consume,daemon=True); th.start()
+
         while True:
             try:
                 raw = await ws.receive_text()
             except WebSocketDisconnect:
                 break
+
             msg=json.loads(raw)
             if msg.get("type")=="audio_chunk" and msg.get("format")=="PCM_S16LE_16000":
                 audio_q.put(base64.b64decode(msg.get("data","")))
@@ -162,32 +189,57 @@ async def ws_endpoint(ws: WebSocket):
                 pass
             elif msg.get("type")=="session_end":
                 break
+
             while not out_q.empty():
                 text,is_final=out_q.get()
                 if not text: continue
+
                 if is_final:
+                    # 1) Önce yön komutuna bak
+                    cmd = extract_drive_cmd(text)
+                    if cmd:
+                        await ws.send_text(json.dumps({"type":"function_call","name":"drive_cmd","args":{"action":cmd}}))
+                        say_map = {"FWD":"İleri hareket.","REV":"Geri hareket.","STOP":"Durduruyorum."}
+                        await ws.send_text(json.dumps({"type":"assistant_say","text": say_map[cmd]}))
+                        chat_history.append({"role":"assistant","content":say_map[cmd]})
+                        continue
+
+                    # 2) Yüzde/sayı
                     p=extract_percent(text)
                     if p is not None:
                         await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p}}))
                         await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p} olarak ayarlıyorum."}))
-                    else:
-                        chat_history.append({"role":"user","content":text})
-                        result = safe_llm_decide(text, chat_history)
-                        if result.get("type")=="tool":
-                            name = result.get("name")
-                            args = result.get("args",{})
-                            if name=="set_pwm" and isinstance(args.get("percent"), int):
-                                p2 = max(0, min(100, int(args["percent"])))
-                                await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p2}}))
-                                await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p2} olarak ayarlıyorum."}))
-                                chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p2} olarak ayarlıyorum."})
-                            else:
-                                await ws.send_text(json.dumps({"type":"assistant_say","text":"Anladım."}))
-                                chat_history.append({"role":"assistant","content":"Anladım."})
+                        chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p} olarak ayarlıyorum."})
+                        continue
+
+                    # 3) LLM'e düş (sohbet ya da araç kararı)
+                    chat_history.append({"role":"user","content":text})
+                    result = safe_llm_decide(text, chat_history)
+
+                    if result.get("type")=="tool":
+                        name = result.get("name")
+                        args = result.get("args",{})
+
+                        if name=="set_pwm" and isinstance(args.get("percent"), int):
+                            p2 = max(0, min(100, int(args["percent"])))
+                            await ws.send_text(json.dumps({"type":"function_call","name":"set_pwm","args":{"percent":p2}}))
+                            await ws.send_text(json.dumps({"type":"assistant_say","text":f"Referans değerini yüzde {p2} olarak ayarlıyorum."}))
+                            chat_history.append({"role":"assistant","content":f"Referans değerini yüzde {p2} olarak ayarlıyorum."})
+
+                        elif name=="drive_cmd" and (args.get("action") in ("FWD","REV","STOP")):
+                            act = args["action"]
+                            await ws.send_text(json.dumps({"type":"function_call","name":"drive_cmd","args":{"action":act}}))
+                            say_map = {"FWD":"İleri hareket.","REV":"Geri hareket.","STOP":"Durduruyorum."}
+                            await ws.send_text(json.dumps({"type":"assistant_say","text": say_map[act]}))
+                            chat_history.append({"role":"assistant","content":say_map[act]})
+
                         else:
-                            say = result.get("text","Anladım.")
-                            await ws.send_text(json.dumps({"type":"assistant_say","text":say}))
-                            chat_history.append({"role":"assistant","content":say})
+                            await ws.send_text(json.dumps({"type":"assistant_say","text":"Anladım."}))
+                            chat_history.append({"role":"assistant","content":"Anladım."})
+                    else:
+                        say = result.get("text","Anladım.")
+                        await ws.send_text(json.dumps({"type":"assistant_say","text":say}))
+                        chat_history.append({"role":"assistant","content":say})
     finally:
         try: audio_q.put(None)
         except: pass
